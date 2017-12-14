@@ -18,7 +18,8 @@ def stackedAutoencoder(x, num_layers=3, layer_units=[784, 400, 400, 400], pretra
     # ae_vars = {'h_enc0': x}
     reprs = {0: x}
     for i in range(1, num_layers+1):
-        with tf.variable_scope('autoencoder_{}'.format(i), reuse=tf.AUTO_REUSE):
+        # reuse = False if pretraining and i == num_layers else True
+        with tf.variable_scope('ae{}'.format(i), reuse=tf.AUTO_REUSE):
             x_hat = reprs[i-1]
             if i == num_layers and pretraining:
                 input = tf.multiply(
@@ -30,17 +31,19 @@ def stackedAutoencoder(x, num_layers=3, layer_units=[784, 400, 400, 400], pretra
             else:
                 input = x_hat
 
-            W_enc = tf.get_variable('W_enc', initializer=tf.truncated_normal([layer_units[i-1], layer_units[i]], stddev=0.1))
-            b_enc = tf.get_variable('b_enc', initializer=tf.constant(0.1, shape=[layer_units[i]]))
-            reprs[i] = tf.nn.sigmoid(tf.matmul(input, W_enc) + b_enc)
+            with tf.variable_scope('encoder', reuse=tf.AUTO_REUSE):
+                W_enc = tf.get_variable('W', initializer=tf.truncated_normal([layer_units[i-1], layer_units[i]], stddev=0.1))
+                b_enc = tf.get_variable('b', initializer=tf.constant(0.1, shape=[layer_units[i]]))
+                reprs[i] = tf.nn.sigmoid(tf.matmul(input, W_enc) + b_enc)
 
     if pretraining:
-        with tf.variable_scope('autoencoder_{}'.format(i), reuse=tf.AUTO_REUSE):
-            W_dec = tf.get_variable('W_dec', initializer=tf.truncated_normal([layer_units[i], layer_units[i-1]], stddev=0.1))
-            b_dec = tf.get_variable('b_dec', initializer=tf.constant(0.1, shape=[layer_units[i-1]]))
-            recon = tf.matmul(reprs[i], W_dec) + b_dec
-            # recon = tf.nn.sigmoid(tf.matmul(h_enc, W_dec) + b_dec)
-            return x_hat, recon
+        with tf.variable_scope('ae{}'.format(i)):
+            with tf.variable_scope('decoder'):
+                W_dec = tf.get_variable('W', initializer=tf.truncated_normal([layer_units[i], layer_units[i-1]], stddev=0.1))
+                b_dec = tf.get_variable('b', initializer=tf.constant(0.1, shape=[layer_units[i-1]]))
+                recon = tf.matmul(reprs[i], W_dec) + b_dec
+                # recon = tf.nn.sigmoid(tf.matmul(h_enc, W_dec) + b_dec)
+                return x_hat, recon
 
     return reprs[i]
 
@@ -52,7 +55,7 @@ def deepnn(x, num_ae_layers=3):
         logits = tf.matmul(h, W) + b
         return logits
 
-def pretrain(layer, mnist, sess, iters):
+def pretrain(layer, mnist, sess, iters, pretrain_flag):
   # Create the model
   x = tf.placeholder(tf.float32, [None, 784])
 
@@ -66,10 +69,10 @@ def pretrain(layer, mnist, sess, iters):
   cross_entropy = tf.reduce_mean(cross_entropy)
 
   # Will minimize and initialize these vars
-  model_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='autoencoder_{}'.format(layer))
+  model_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='ae{}'.format(layer))
 
   with tf.variable_scope('adam_optimizer_layer_{}'.format(layer), reuse=tf.AUTO_REUSE):
-    optimizer = tf.train.AdamOptimizer(1e-4)
+    optimizer = tf.train.AdamOptimizer(5e-3)
     train_step = optimizer.minimize(cross_entropy, var_list=model_variables)
   # model_variables = my_model.get_variables_list()
   optimizer_slots = [
@@ -99,7 +102,9 @@ def pretrain(layer, mnist, sess, iters):
 
   with sess.as_default():
     init_op.run()
-    for i in range(iters):
+    # if layer == 1:
+        # print(model_variables[0][500,:50].eval(session=sess))
+    for i in range(iters * bool(pretrain_flag)):
       batch = mnist.train.next_batch(50)
       if i % 100 == 0:
         train_xentropy = cross_entropy.eval(feed_dict={x: batch[0]})
@@ -107,6 +112,8 @@ def pretrain(layer, mnist, sess, iters):
         print('step %d, train xentropy %g' % (i, train_xentropy))
       train_step.run(feed_dict={x: batch[0]})
 
+    # if layer == 1:
+        # print(model_variables[0][500,:50].eval(session=sess))
     print('test xentropy %g' % cross_entropy.eval(feed_dict={x: mnist.test.images}))
 
 def finetune(layers, mnist, sess, iters):
@@ -126,10 +133,11 @@ def finetune(layers, mnist, sess, iters):
   # Will minimize all feed-forward vars
   var_list = []
   for i in range(1,layers+1):
-      with tf.variable_scope('autoencoder_{}'.format(i), reuse=tf.AUTO_REUSE):
-        W_enc = tf.get_variable('W_enc')
-        b_enc = tf.get_variable('b_enc')
-        var_list.extend([W_enc, b_enc])
+      with tf.variable_scope('ae{}'.format(i), reuse=tf.AUTO_REUSE):
+          with tf.variable_scope('encoder', reuse=tf.AUTO_REUSE):
+              W_enc = tf.get_variable('W')
+              b_enc = tf.get_variable('b')
+              var_list.extend([W_enc, b_enc])
 
   fc_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='fc')
   var_list.extend(fc_vars)
@@ -152,9 +160,6 @@ def finetune(layers, mnist, sess, iters):
       *fc_vars,
       *optimizer_slots,
   ]
-  print('--'*20)
-  print(fc_vars)
-  print('--'*20)
   init_op = tf.variables_initializer(all_variables)
 
   with tf.name_scope('accuracy'):
@@ -176,6 +181,7 @@ def finetune(layers, mnist, sess, iters):
         train_xentropy = cross_entropy.eval(feed_dict={x: batch[0], y_: batch[1]})
         print('step %d, training accuracy %g' % (i, train_accuracy), '\t|||\t', 'train xentropy %g' % (train_xentropy))
       train_step.run(feed_dict={x: batch[0], y_: batch[1]})
+    # print(var_list[0][500,:50].eval(session=sess))
 
     print('test accuracy %g' % accuracy.eval(feed_dict={x: mnist.test.images, y_: mnist.test.labels}))
 
@@ -202,7 +208,7 @@ def main(_):
   sess.run(tf.global_variables_initializer())
 
   for layer in range(1, FLAGS.num_layers+1):
-      pretrain(layer, mnist, sess, FLAGS.unsup_iters)
+      pretrain(layer, mnist, sess, FLAGS.unsup_iters, FLAGS.pretrain)
   finetune(FLAGS.num_layers, mnist, sess, FLAGS.sup_iters)
 
   sess.close()
@@ -221,5 +227,9 @@ if __name__ == '__main__':
   parser.add_argument('--sup_iters', type=int,
                       default=500,
                       help='Supervised training iters')
+  parser.add_argument('--pretrain', type=int,
+                      default=1,
+                      help='Pretrain - 1=True/0=False (default: 1)')
   FLAGS, unparsed = parser.parse_known_args()
+  # import pdb; pdb.set_trace()
   tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
